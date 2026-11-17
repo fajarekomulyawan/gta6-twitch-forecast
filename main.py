@@ -1,21 +1,35 @@
 """Forecast a launch day's Twitch viewers, hour by hour, from comparable launches.
 
-Idea: a big game's release-day shape is not flat. Viewers surge and fade at
-similar hours across past launches when each launch is measured against its
-own first hour. So for every hour h we collect, from every comparable launch
-in the case, the ratio
+Method (v2, tuned by leave-one-out cross-validation over the comparables):
+
+A big game's release-day shape is not flat: viewers surge and fade at similar
+hours across past launches when each launch is measured against its own first
+hour. For every hour h we collect, from every comparable launch, the ratio
 
     r_h = (viewers in hour h of that launch's release day) / (its hour 1)
 
-and forecast this case's quantiles as hour 1's print times the empirical
-quantiles of those ratios. The spread therefore comes from how much real
-launches actually disagreed with each other at that hour, not from a fixed
-formula. Everything is deterministic: ratios are sorted, quantiles use
-linear interpolation, and no clock, randomness or network is involved.
+and forecast this case's quantiles as hour 1's print times weighted quantiles
+of those ratios. Three refinements over plain empirical quantiles, each kept
+because it lowered the cross-validated pinball loss on the log scale (the
+contest's own metric) for launches with a large first hour like this one:
 
-Runs as the grader runs it: python3 main.py with MAKEFUN_INPUT_DIR /
-MAKEFUN_OUTPUT_DIR set locally, or /input and /output in the sandbox.
-Standard library only.
+1. Quality gate. A comparable counts only when its first hour was a real
+   launch hour: at least 10,000 viewers and at least a quarter of its own
+   day's peak. Launches that unlocked late in the UTC day (a global unlock at
+   16:00Z, say) have a near-empty hour 1, so their ratios explode and say
+   nothing about a midnight-rolling console launch like this one.
+2. Size weighting. A comparable's weight falls off with the distance between
+   its first hour and this case's, exp(-|ln p1 - ln h0| / 0.9): a launch that
+   opened at 850k shapes the forecast of another huge launch more than one
+   that opened at 30k, because the two audiences behave differently by hour.
+3. Tier weighting. The case notes tag each comparable's tier; early-access
+   contaminated launches count 0.7 and weak ones 0.6, since their release-day
+   curves are distorted, and the target category's own pre-release history
+   counts 0 (it is no launch at all).
+
+Everything is deterministic: ratios are sorted, weighted quantiles use
+linear interpolation on cumulative weights, and no clock, randomness or
+network is involved. Standard library only.
 """
 
 import json
@@ -32,10 +46,23 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
 # A comparable counts only when its first hour was a real launch hour.
-MIN_FIRST_HOUR = 1000
+MIN_FIRST_HOUR = 10000
+MIN_FIRST_HOUR_PEAK_SHARE = 0.25
 # Keep one wild comparable from dragging a quantile to an absurd place.
 RATIO_MIN = 0.02
 RATIO_MAX = 20.0
+# How fast a comparable's weight decays with first-hour size distance (log units).
+SIZE_SCALE = 0.9
+# Trust the weighted pool only once it carries at least this much weight.
+MIN_POOL_WEIGHT = 2.5
+MIN_POOL_COUNT = 5
+# Tier weights from the case notes; an untagged comparable counts in full.
+TIER_WEIGHTS = {
+    "comparable": 1.0,
+    "early-access-contaminated": 0.7,
+    "weak": 0.6,
+    "target-history": 0.0,
+}
 
 
 def round2(x):
@@ -48,16 +75,36 @@ def round2(x):
     return int(value) if float(value).is_integer() else value
 
 
-def quantile(sorted_values, tau):
-    """The tau quantile of a sorted list, by linear interpolation."""
-    n = len(sorted_values)
-    if n == 1:
-        return sorted_values[0]
-    pos = (n - 1) * tau
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, n - 1)
-    frac = pos - lo
-    return sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac
+def weighted_quantile(sorted_pairs, tau):
+    """The tau quantile of (value, weight) pairs sorted by value.
+
+    Linear interpolation across the cumulative-weight axis, so a pair with
+    twice the weight spans twice the axis of an ordinary one.
+    """
+    total = sum(w for _, w in sorted_pairs)
+    if total <= 0:
+        return sorted_pairs[len(sorted_pairs) // 2][0]
+    target = tau * total
+    acc = 0.0
+    prev_value, prev_acc = sorted_pairs[0][0], 0.0
+    for value, weight in sorted_pairs:
+        acc += weight
+        if acc >= target:
+            if acc == prev_acc:
+                return value
+            frac = (target - prev_acc) / (acc - prev_acc)
+            return prev_value + (value - prev_value) * frac
+        prev_value, prev_acc = value, acc
+    return sorted_pairs[-1][0]
+
+
+def tier_weight(comparable):
+    """The weight the case notes' tier earns this comparable (1.0 untagged)."""
+    unlock = str(comparable.get("unlock") or "")
+    if "Tier:" not in unlock:
+        return 1.0
+    tier = unlock.split("Tier:", 1)[1].split(".", 1)[0].strip().lower()
+    return TIER_WEIGHTS.get(tier, 1.0)
 
 
 def launch_day_ratios(comparable):
@@ -65,7 +112,9 @@ def launch_day_ratios(comparable):
 
     Hour 0 of the release date is that launch's hour 1, so the ratio for
     forecast hour h (2..24) is day[h - 1] / day[0]. Returns None when the
-    comparable has no usable release day.
+    comparable has no usable release day: too few hours, or a first hour
+    that was not a real launch hour (too small outright, or next to its
+    own day's peak — the mark of a launch that unlocked late in the day).
     """
     day_date = str(comparable.get("day_start", ""))[:10]
     if not day_date:
@@ -79,13 +128,16 @@ def launch_day_ratios(comparable):
             except ValueError:
                 continue
     first = day.get(0, 0.0)
-    if first < MIN_FIRST_HOUR or len(day) < 18:
+    if len(day) < 18 or first < MIN_FIRST_HOUR:
         return None
-    return {h: day[h - 1] / first for h in range(2, 25) if (h - 1) in day}
+    if first < MIN_FIRST_HOUR_PEAK_SHARE * max(day.values()):
+        return None
+    ratios = {h: day[h - 1] / first for h in range(2, 25) if (h - 1) in day}
+    return ratios, first
 
 
 def fallback_quantiles(p1, hour):
-    """The persistence shape, used only if a case carries no comparables."""
+    """The persistence shape, used only if a case carries no usable comparables."""
     spread = 0.15 * math.sqrt(hour - 1)
     return [round2(p1 * math.exp(z * spread)) for z in Z]
 
@@ -97,24 +149,36 @@ def forecast_case(case):
     if first is None:
         raise ValueError("no hour-1 print")
     p1 = max(1.0, float(first["viewers"]))
+    own_name = str((case.get("game") or {}).get("name") or "")
 
-    ratios_by_hour = {h: [] for h in range(2, 25)}
+    # Weighted ratio pools, one per forecast hour. A comparable's weight is
+    # set once — by its size distance to this case and by its tier — and the
+    # same weight rides on every hour it speaks for.
+    pools = {h: [] for h in range(2, 25)}
     for comparable in case.get("comparables") or []:
-        ratios = launch_day_ratios(comparable)
-        if ratios is None:
+        if own_name and str(comparable.get("name") or "") == own_name:
+            continue  # the target is never its own comparable
+        found = launch_day_ratios(comparable)
+        if found is None:
+            continue
+        ratios, first_hour = found
+        size_weight = math.exp(-abs(math.log(p1) - math.log(first_hour)) / SIZE_SCALE)
+        weight = size_weight * tier_weight(comparable)
+        if weight <= 0:
             continue
         for hour, ratio in ratios.items():
             if RATIO_MIN <= ratio <= RATIO_MAX:
-                ratios_by_hour[hour].append(ratio)
-    for hour in ratios_by_hour:
-        ratios_by_hour[hour].sort()
+                pools[hour].append((ratio, weight))
+    for hour in pools:
+        pools[hour].sort(key=lambda pair: pair[0])
 
     rows = []
     for wanted in case["forecast"]:
         hour = int(wanted["hour"])
-        ratios = ratios_by_hour.get(hour, [])
-        if len(ratios) >= 5:
-            qs = [round2(p1 * quantile(ratios, tau)) for tau in LEVELS]
+        pairs = pools.get(hour, [])
+        total_weight = sum(w for _, w in pairs)
+        if len(pairs) >= MIN_POOL_COUNT and total_weight >= MIN_POOL_WEIGHT:
+            qs = [round2(p1 * weighted_quantile(pairs, tau)) for tau in LEVELS]
         else:
             qs = fallback_quantiles(p1, hour)
         # The output contract: every quantile above 0 and at most 1e9.
